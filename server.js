@@ -1,0 +1,214 @@
+const express = require('express');
+const { Pool } = require('pg');
+
+const app = express();
+app.use(express.json());
+
+// Initialize PostgreSQL Connection Pool using Environment Variable
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
+});
+
+// ==========================================
+// 1. DATABASE AUTO-MIGRATION ON STARTUP
+// ==========================================
+async function runMigrations() {
+  const client = await db.connect();
+  try {
+    console.log('Running database migrations...');
+    await client.query('BEGIN');
+
+    // Create users base table if it doesn't exist
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        role VARCHAR(50) DEFAULT 'user',
+        last_login_at TIMESTAMP WITH TIME ZONE,
+        last_active_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Ensure tracking columns exist if users table already pre-existed
+    await client.query(`
+      ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'user',
+        ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP WITH TIME ZONE,
+        ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP WITH TIME ZONE;
+    `);
+
+    // Index tracking fields for fast analytics queries
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+      CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active_at);
+    `);
+
+    // Create login audit logs table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS login_logs (
+        id BIGSERIAL PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role VARCHAR(50) NOT NULL,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Index login logs for cohort calculations
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_login_logs_user_role ON login_logs(user_id, role);
+      CREATE INDEX IF NOT EXISTS idx_login_logs_created_at ON login_logs(created_at);
+    `);
+
+    await client.query('COMMIT');
+    console.log('Migrations completed successfully.');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Migration failed:', error);
+  } finally {
+    client.release();
+  }
+}
+
+// ==========================================
+// 2. TRACKING HELPERS & MIDDLEWARE
+// ==========================================
+
+// Helper function to log successful user authentication
+async function recordUserLogin(userId, role, req) {
+  const ipAddress = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const userAgent = req.headers['user-agent'];
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE users 
+       SET last_login_at = NOW(), last_active_at = NOW() 
+       WHERE id = $1`,
+      [userId]
+    );
+
+    await client.query(
+      `INSERT INTO login_logs (user_id, role, ip_address, user_agent) 
+       VALUES ($1, $2, $3, $4)`,
+      [userId, role, ipAddress, userAgent]
+    );
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Failed to record login event:', error);
+  } finally {
+    client.release();
+  }
+}
+
+// Middleware to track active session requests
+async function trackUserActivity(req, res, next) {
+  if (req.user && req.user.id) {
+    // Asynchronous background update without delaying the API request
+    db.query('UPDATE users SET last_active_at = NOW() WHERE id = $1', [req.user.id])
+      .catch(err => console.error('Activity tracking error:', err));
+  }
+  next();
+}
+
+// ==========================================
+// 3. API ENDPOINTS
+// ==========================================
+
+// User Login Endpoint
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    // Fetch user from DB
+    const userResult = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    const user = userResult.rows[0];
+
+    if (!user || user.password !== password) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Record login metrics immediately after successful authentication
+    await recordUserLogin(user.id, user.role, req);
+
+    res.json({
+      message: 'Login successful',
+      user: { id: user.id, email: user.email, role: user.role }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin Analytics Endpoint (Executes SQL Analytics Queries)
+app.get('/api/admin/metrics', async (req, res) => {
+  try {
+    const metricsQuery = `
+      SELECT 
+        (SELECT COUNT(*) FROM users WHERE role = 'parent') AS total_parents,
+        (SELECT COUNT(DISTINCT id) FROM users WHERE last_active_at >= NOW() - INTERVAL '24 hours') AS dau,
+        (SELECT COUNT(DISTINCT id) FROM users WHERE last_active_at >= NOW() - INTERVAL '30 days') AS mau,
+        (SELECT COUNT(*) FROM login_logs WHERE role = 'parent' AND created_at >= CURRENT_DATE) AS parent_logins_today
+    `;
+
+    const roleBreakdownQuery = `
+      SELECT role, COUNT(DISTINCT id) AS active_last_7_days
+      FROM users
+      WHERE last_active_at >= NOW() - INTERVAL '7 days'
+      GROUP BY role
+    `;
+
+    const [metricsResult, roleBreakdownResult] = await Promise.all([
+      db.query(metricsQuery),
+      db.query(roleBreakdownQuery)
+    ]);
+
+    const metrics = metricsResult.rows[0];
+
+    res.json({
+      status: 'success',
+      data: {
+        totalParents: parseInt(metrics.total_parents, 10),
+        dailyActiveUsers: parseInt(metrics.dau, 10),
+        monthlyActiveUsers: parseInt(metrics.mau, 10),
+        parentLoginsToday: parseInt(metrics.parent_logins_today, 10),
+        activeUsersByRole: roleBreakdownResult.rows.map(row => ({
+          role: row.role,
+          activeCount: parseInt(row.active_last_7_days, 10)
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching admin metrics:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Protected Example Route (Tracks active usage)
+app.get('/api/parent/dashboard', (req, res, next) => {
+  // Simulate auth middleware populating req.user
+  req.user = { id: 1, role: 'parent' };
+  next();
+}, trackUserActivity, (req, res) => {
+  res.json({ message: 'Welcome to the parent portal!' });
+});
+
+// ==========================================
+// 4. SERVER INITIALIZATION
+// ==========================================
+const PORT = process.env.PORT || 3000;
+
+runMigrations().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+});
